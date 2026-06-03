@@ -1,23 +1,81 @@
 """
 api/index.py — Flask app exposed as a Vercel Python serverless function.
 
-Vercel routes /api/(.*) to this function (see vercel.json). Flask routes are
-declared with their /api/... prefix so the original paths are preserved. The
-WSGI `app` object is what Vercel's Python runtime invokes.
+Self-contained on purpose: Vercel's Python runtime bundles the entrypoint file
+but does not reliably include sibling modules, so the Supabase client and the
+(perceptual-hash) recognition engine are inlined here rather than imported.
+
+Vercel routes /api/(.*) to this function (see vercel.json). Flask routes keep
+their /api/... prefix so the original paths are preserved.
 """
 from __future__ import annotations
 
 import datetime as dt
+import io
 import os
 
 import bcrypt
 import jwt
+import numpy as np
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+from PIL import Image
+from supabase import create_client, Client
 
-from supabase_client import supabase
-import face_engine
+# --------------------------------------------------------------------------- #
+#  Supabase client (inlined)
+# --------------------------------------------------------------------------- #
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+    raise RuntimeError("Set SUPABASE_URL and SUPABASE_SERVICE_KEY in Vercel env vars.")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
+# --------------------------------------------------------------------------- #
+#  Recognition engine (inlined perceptual-hash / dHash)
+# --------------------------------------------------------------------------- #
+HASH_SIZE = 16  # -> 256-bit fingerprint
+TOLERANCE = float(os.environ.get("FACE_MATCH_TOLERANCE", "0.22"))
+
+
+def encode_face(image_bytes):
+    """256-length 0/1 perceptual-hash vector, or None on decode error."""
+    try:
+        img = (Image.open(io.BytesIO(image_bytes)).convert("L")
+               .resize((HASH_SIZE + 1, HASH_SIZE), Image.LANCZOS))
+    except Exception:
+        return None
+    px = np.asarray(img, dtype=np.float32)
+    diff = px[:, 1:] > px[:, :-1]
+    return diff.flatten().astype(np.float32).tolist()
+
+
+def match_face(probe_bytes, gallery):
+    probe = encode_face(probe_bytes)
+    if probe is None:
+        return {"result": "no_face"}
+    if not gallery:
+        return {"result": "unknown", "distance": 1.0}
+    probe_vec = np.array(probe, dtype=np.float32)
+    best_dist, best = 1.0, None
+    for g in gallery:
+        vec = np.array(g["encoding"], dtype=np.float32)
+        if vec.shape != probe_vec.shape:
+            continue
+        d = float(np.mean(np.abs(vec - probe_vec)))
+        if d < best_dist:
+            best_dist, best = d, g
+    if best is not None and best_dist <= TOLERANCE:
+        return {"result": "match", "student_id": best["student_id"],
+                "full_name": best["full_name"], "roll_number": best["roll_number"],
+                "distance": round(best_dist, 4),
+                "confidence": round(max(0.0, 1.0 - best_dist), 4)}
+    return {"result": "unknown", "distance": round(best_dist, 4)}
+
+
+# --------------------------------------------------------------------------- #
+#  Flask app
+# --------------------------------------------------------------------------- #
 app = Flask(__name__)
 CORS(app)
 
@@ -118,7 +176,7 @@ def register_student():
 
     encoded = 0
     for i, f in enumerate(photos, start=1):
-        vec = face_engine.encode_face(f.read())
+        vec = encode_face(f.read())
         if vec is None:
             continue
         supabase.table("face_encodings").insert({
@@ -155,7 +213,7 @@ def scan():
         "roll_number": studs.get(e["student_id"], {}).get("roll_number", "?"),
     } for e in enc if e["student_id"] in studs]
 
-    outcome = face_engine.match_face(frame.read(), gallery)
+    outcome = match_face(frame.read(), gallery)
     if outcome["result"] == "no_face":
         return ok({"status": "no_face", "message": "Could not read the frame. Try again."})
     if outcome["result"] == "unknown":
@@ -212,9 +270,8 @@ def student_history(roll_number):
 
 @app.get("/api/health")
 def health():
-    return ok({"service": "attendance-backend", "engine": "perceptual-hash", "dlib": face_engine._HAS_DLIB})
+    return ok({"service": "attendance-backend", "engine": "perceptual-hash"})
 
 
-# Local run (Vercel ignores this and uses the `app` WSGI object directly)
 if __name__ == "__main__":
     app.run(port=int(os.environ.get("FLASK_PORT", "5000")), debug=True)
