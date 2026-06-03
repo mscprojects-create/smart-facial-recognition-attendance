@@ -1,0 +1,17 @@
+# dependencies
+node_modules/
+frontend/dist/
+# python
+__pycache__/
+*.pyc
+venv/
+.venv/
+# env & secrets
+.env
+backend/.env
+frontend/.env
+# uploads / runtime
+backend/uploads/*
+!backend/uploads/.gitkeep
+# os
+.DS_Store
