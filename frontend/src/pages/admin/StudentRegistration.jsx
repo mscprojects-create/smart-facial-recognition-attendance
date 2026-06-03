@@ -17,10 +17,51 @@ export default function StudentRegistration() {
   const loadStudents = () => api.students().then(setStudents).catch(() => {});
   useEffect(() => { loadStudents(); }, []);
 
-  function onFiles(e) {
-    const files = Array.from(e.target.files).slice(0, 5);
-    setPhotos(files);
-    setPreviews(files.map((f) => URL.createObjectURL(f)));
+  // Downscale a picked image to a small JPEG so 5 photos stay well under the
+  // serverless request-body limit (and keep the recogniser input consistent).
+  function resizeImage(file, max = 512, quality = 0.85) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => {
+        let { width: w, height: h } = img;
+        const scale = Math.min(1, max / Math.max(w, h));
+        w = Math.round(w * scale);
+        h = Math.round(h * scale);
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+        canvas.getContext("2d").drawImage(img, 0, 0, w, h);
+        canvas.toBlob(
+          (blob) => {
+            URL.revokeObjectURL(img.src);
+            const name = file.name.replace(/\.[^.]+$/, "") + ".jpg";
+            resolve(new File([blob], name, { type: "image/jpeg" }));
+          },
+          "image/jpeg",
+          quality
+        );
+      };
+      img.onerror = reject;
+      img.src = URL.createObjectURL(file);
+    });
+  }
+
+  // Accumulate selections (so photos can be added one or several at a time),
+  // cap at 5, and resize each before storing.
+  async function onFiles(e) {
+    setMsg(null);
+    const picked = Array.from(e.target.files);
+    e.target.value = ""; // allow re-selecting the same file later
+    const room = 5 - photos.length;
+    if (room <= 0) return;
+    try {
+      const resized = await Promise.all(picked.slice(0, room).map((f) => resizeImage(f)));
+      const next = [...photos, ...resized].slice(0, 5);
+      setPhotos(next);
+      setPreviews(next.map((f) => URL.createObjectURL(f)));
+    } catch {
+      setMsg({ type: "error", text: "Could not read one of the images. Try a different file." });
+    }
   }
   function removePhoto(i) {
     setPhotos(photos.filter((_, idx) => idx !== i));
@@ -86,8 +127,8 @@ export default function StudentRegistration() {
               <input type="file" accept="image/*" multiple className="hidden" onChange={onFiles} />
               <div className="border-2 border-dashed border-white/15 rounded-2xl p-8 text-center hover:border-brand-400/50 transition">
                 <Upload className="h-7 w-7 mx-auto text-brand-300 mb-2" />
-                <p className="text-sm text-slate-300">Click to upload 5 photos of the student</p>
-                <p className="text-xs text-slate-500 mt-1">JPG / PNG · front-facing, well-lit</p>
+                <p className="text-sm text-slate-300">Click to add photos — select 5 at once, or a few at a time</p>
+                <p className="text-xs text-slate-500 mt-1">JPG / PNG · front-facing, well-lit · auto-resized on upload</p>
               </div>
             </label>
 
